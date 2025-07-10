@@ -12,6 +12,11 @@ from typing import Optional, Union, Tuple
 import torch
 import torch.nn.functional as F
 import numpy as np
+import sys
+
+# BD
+#import xnvme
+from flexllmgen.nvme_binding import XNVMeNamespace as NVMeDevice
 
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
@@ -285,6 +290,9 @@ class TorchDevice:
         return TorchTensor.create_from_torch(ids, self)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
+        # BD: Prevent KV cache allocation on GPU
+        raise NotImplementedError("BD: KV cache should not be allocated on GPU")
+    
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
@@ -617,11 +625,162 @@ class TorchDevice:
     def __str__(self):
         return f"TorchDevice(name={self.name})"
 
+# BD
+class TorchNVMe:
+    def __init__(self, path, mem_capacity=None, cuda_id=0, num_copy_threads=1, start_lba=2048):
+        print("\033[32mBD: num_copy_threads: ", num_copy_threads, "\033[0m")
+        
+        # Initialize NVMe device
+        self.nvme_device = NVMeDevice(uri=path, use_io_uring=False)
+        self.lba_size = self.nvme_device.get_lba_size()
+        # Align to 4K boundary (8 LBA blocks) for better performance
+        aligned_start_lba = ((start_lba + 7) // 8) * 8
+        self.start_lba = aligned_start_lba
+        self.next_lba = aligned_start_lba
+        
+        print(f"[DEBUG] NVMe LBA alignment:")
+        print(f"  - Original start_lba: {start_lba}")
+        print(f"  - Aligned start_lba: {aligned_start_lba}")
+        print(f"  - LBA size: {self.lba_size}")
+
+        # LBA management: tensor_name -> Start LBA, Num Blocks
+        self.tensor_lba_map = {}  # {tensor_name: {'start_lba': int, 'num_blocks': int}}
+
+        print("\033[32mBD: TorchNVMe Init.", "\033[0m")
+        print("-device_path: ", path)
+        print("-lba_size: ", self.lba_size)
+        print("-start_lba: ", self.start_lba)
+
+
+        # Device type and other attributes
+        self.name = path
+        self.device_type = DeviceType.DISK
+        self.compressed_device = TorchCompressedDevice(self)
+        
+        # Copy threads setup
+        self.copy_queue = queue.Queue()
+        self.copy_threads = [
+            threading.Thread(
+                target=copy_worker_func_nvme, args=(self.copy_queue, cuda_id)
+            ) for _ in range(num_copy_threads)
+        ]
+        for t in self.copy_threads:
+            t.start()
+
+        global global_disk_device
+        global_disk_device = self
+
+    def add_link(self, link):
+        dst = link.b if link.a == self else link.a
+        self.links[dst] = link
+
+    def _calculate_required_blocks(self, shape, dtype):
+        total_bytes = np.prod(shape) * torch_dtype_to_num_bytes[np_dtype_to_torch_dtype[dtype]]
+        num_blocks = (total_bytes + self.lba_size - 1) // self.lba_size  
+        return int(num_blocks)
+
+    def allocate(self, shape, dtype, pin_memory=None, name=None):
+        name = name or TorchTensor.next_name()
+        
+        # calculate required blocks
+        num_blocks = self._calculate_required_blocks(shape, dtype)
+        
+        # LBA allocation
+        start_lba = self.next_lba
+        self.next_lba += num_blocks
+        
+        # save LBA info
+        self.tensor_lba_map[name] = {
+            'start_lba': start_lba,
+            'num_blocks': num_blocks
+        }
+        
+        # virtual path (actually, LBA address is used)
+        path = f"nvme://{self.name}/{name}"
+        
+        print(f"\033[32mBD: NVMe allocate, {name}\033[0m")
+        print(f"  - shape: {shape}, dtype: {dtype}")
+        print(f"  - start_lba: {start_lba}, num_blocks: {num_blocks}")
+        print(f"  - total_bytes: {np.prod(shape) * torch_dtype_to_num_bytes[np_dtype_to_torch_dtype[dtype]]}")
+        print(f"  - path: {path}")
+        
+        tensor = TorchTensor(shape, np_dtype_to_torch_dtype[dtype], path, self, name=name)
+        
+        return tensor
+
+    def get_tensor_lba_info(self, tensor_name):
+        """텐서 이름으로 LBA 정보 조회"""
+        return self.tensor_lba_map.get(tensor_name)
+
+    def delete(self, tensor):
+        # For NVMe tensors, use TRIM to properly free blocks
+        if tensor.name in self.tensor_lba_map:
+            # Get LBA information from tensor_lba_map
+            lba_info = self.tensor_lba_map[tensor.name]
+            start_lba = lba_info['start_lba']
+            num_blocks = lba_info['num_blocks']
+            
+            # TRIM the blocks to free them using the xNVMe API
+            self.nvme_device.trim(start_lba, num_blocks)
+            print(f"\033[32mBD: NVMe TRIM\033[0m LBA {start_lba}, blocks {num_blocks}")
+            
+            # Delete LBA info from tensor lba map
+            del self.tensor_lba_map[tensor.name]
+        pass
+
+    def init_cache_one_gpu_batch(self, config, task, policy):
+        num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
+            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+            policy.gpu_batch_size)
+        print("\033[32mBD: TorchNVMe Init Cache", "\033[0m")
+        print("- num_head: ", num_head)
+        print("- hidden_size: ", hidden_size)
+        print("- prompt_len: ", prompt_len)
+        print("- gen_len: ", gen_len)
+        print("- gpu_batch_size: ", gpu_batch_size)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        k_cache = self.allocate(shape, np.float16)
+        v_cache = self.allocate(shape, np.float16)
+        return k_cache, v_cache
+
+    def submit_copy(self, *args):
+        dst, dst_indices, src, src_indices = args
+        self.copy_queue.put_nowait(args)
+
+    def synchronize(self):
+        self.copy_queue.join()
+
+    def close_copy_threads(self):
+        for _ in range(len(self.copy_threads)):
+            self.copy_queue.put_nowait(None)
+        for t in self.copy_threads:
+            t.join()
+        self.copy_queue.join()
+        self.copy_queue = None
+
+    def mem_stats(self):
+        raise NotImplementedError()
+
+    def print_stats(self):
+        print(f"\033[32mBD: TorchNVMe Stats\033[0m")
+        print(f"  - Total tensors: {len(self.tensor_lba_map)}")
+        print(f"  - Next LBA: {self.next_lba}")
+        print(f"  - LBA size: {self.lba_size}")
+        for name, info in self.tensor_lba_map.items():
+            print(f"  - {name}: LBA {info['start_lba']}-{info['start_lba']+info['num_blocks']-1}")
+
+    def __del__(self):
+        if hasattr(self, 'copy_queue') and self.copy_queue:
+            self.close_copy_threads()
+        if hasattr(self, 'nvme_device'):
+            self.nvme_device.close()
+
 
 class TorchDisk:
     """Manage tensors stored on a disk."""
 
-    def __init__(self, path, mem_capacity=None, cuda_id=0, num_copy_threads=4):
+    def __init__(self, path, mem_capacity=None, cuda_id=0, num_copy_threads=1):
+        print("\033[32mBD: num_copy_threads: ", num_copy_threads, "\033[0m")
         self.name = path
         self.path = os.path.abspath(os.path.expanduser(path))
         self.mem_capacity = mem_capacity
@@ -657,18 +816,26 @@ class TorchDisk:
         name = name or TorchTensor.next_name()
         path = os.path.join(self.path, name)
         np.lib.format.open_memmap(path, mode="w+", shape=shape, dtype=dtype)
+        print("\033[32mBD: allocate\033[0m", name, path)
         return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
                            path, self, name=name)
 
     def delete(self, tensor):
-        if os.path.exists(tensor.data) and tensor.delete_file:
-            os.remove(tensor.data)
+        pass
+        #if os.path.exists(tensor.data) and tensor.delete_file:
+        #    os.remove(tensor.data)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
+        print("BD: num_head: ", num_head)
+        print("BD: hidden_size: ", hidden_size)
+        print("BD: prompt_len: ", prompt_len)
+        print("BD: gen_len: ", gen_len)
+        print("BD: gpu_batch_size: ", gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        print("BD: shape: ", shape)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
         return k_cache, v_cache
@@ -736,6 +903,9 @@ class TorchMixedDevice:
                 x.delete()
 
     def init_cache_one_gpu_batch(self, config, task, policy):
+        # BD: Prevent KV cache allocation on mixed devices
+        raise NotImplementedError("BD: KV cache should not be allocated on mixed devices")  
+
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
@@ -875,6 +1045,51 @@ def map_to_torch_tensor(tensor, indices):
     return data[indices] if indices else data
 
 
+def _calculate_lba_offset_and_size(tensor, indices, device):
+    """Calculate LBA offset and size from tensor indices."""
+    if not indices:
+        return 0, tensor.shape, np.prod(tensor.shape) * torch_dtype_to_num_bytes[tensor.dtype]
+    
+    # Calculate offset
+    offset = 0
+    stride = 1
+    for i in range(len(tensor.shape) - 1, -1, -1): 
+        if i < len(indices):
+            idx = indices[i]
+            start_idx = idx.start if isinstance(idx, slice) else idx
+        else:
+            start_idx = 0
+        offset += start_idx * stride
+        stride *= tensor.shape[i]
+    
+    byte_offset = offset * torch_dtype_to_num_bytes[tensor.dtype]
+    lba_offset = byte_offset // device.lba_size
+    
+    # Calculate indexed shape and size
+    indexed_shape = []
+    for i, idx in enumerate(indices):
+        if isinstance(idx, slice):
+            start = idx.start if idx.start is not None else 0
+            stop = idx.stop if idx.stop is not None else tensor.shape[i]
+            step = idx.step if idx.step is not None else 1
+            indexed_shape.append((stop - start) // step)
+        else:
+            indexed_shape.append(1)
+    for i in range(len(indices), len(tensor.shape)):
+        indexed_shape.append(tensor.shape[i])
+    
+    indexed_size = np.prod(indexed_shape)
+    indexed_bytes = indexed_size * torch_dtype_to_num_bytes[tensor.dtype]
+    
+    return lba_offset, indexed_shape, indexed_bytes
+
+def _create_tensor_from_bytes(data_bytes, shape, dtype):
+    """Create tensor from bytes with minimal copying."""
+    # Create writable numpy array from bytes
+    data = np.frombuffer(data_bytes, dtype=torch_dtype_to_np_dtype[dtype]).copy()
+    data = data.reshape(shape)
+    return torch.from_numpy(data)
+
 def copy_worker_func(queue, cuda_id):
     """The copy worker thread."""
     torch.cuda.set_device(cuda_id)
@@ -899,8 +1114,105 @@ def copy_worker_func(queue, cuda_id):
                 size = np.prod(src_data.shape)
                 tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
                 tmp_cpu_buf.copy_(src_data)
+
+                # FILE Write Check (CUDA → DISK)
+                if (src.device.device_type == DeviceType.CUDA and dst.device.device_type == DeviceType.DISK):
+                    print("[FILE Write] src_data shape:", tmp_cpu_buf.shape)
+                    
+                # FILE Read Check (DISK → CUDA)  
+                if (src.device.device_type == DeviceType.DISK and dst.device.device_type == DeviceType.CUDA):
+                    print("[FILE Read] src_data shape:", tmp_cpu_buf.shape)
+
                 dst_data.copy_(tmp_cpu_buf)
             else:
                 dst_data.copy_(src_data)
+
+            queue.task_done()
+
+
+def copy_worker_func_nvme(queue, cuda_id):
+    """The copy worker thread for NVMe direct access."""
+    torch.cuda.set_device(cuda_id)
+
+    cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+    copy_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(copy_stream):
+        while True:
+            item = queue.get()
+            if item is None:
+                queue.task_done()
+                return
+            
+            dst, dst_indices, src, src_indices = item
+            
+            # BD: NVMe write IO (GPU -> NVMe)
+            if (dst.device.device_type == DeviceType.DISK and 
+                hasattr(dst.device, 'nvme_device') and 
+                dst.name in dst.device.tensor_lba_map):
+                
+                lba_info = dst.device.tensor_lba_map[dst.name]
+                start_lba = lba_info['start_lba']
+
+                # Calculate LBA offset using shared function
+                lba_offset, _, _ = _calculate_lba_offset_and_size(dst, dst_indices, dst.device)
+                actual_start_lba = start_lba + lba_offset
+
+                src_data = map_to_torch_tensor(src, src_indices)
+                
+                if src.device.device_type == DeviceType.CUDA:
+                    # GPU -> Pinned CPU -> NVMe
+                    size = np.prod(src_data.shape)
+                    tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+                    tmp_cpu_buf.copy_(src_data)
+                    data_bytes = tmp_cpu_buf.numpy().tobytes()
+                    dst.device.nvme_device.write(data_bytes, actual_start_lba)
+                    #dst.device.nvme_device.write_uring(data_bytes, actual_start_lba)
+                    # Write Check (CUDA → DISK)
+                    if (src.device.device_type == DeviceType.CUDA and dst.device.device_type == DeviceType.DISK):
+                        print("[NVMe Write] src_data shape:", tmp_cpu_buf.shape, "lba:", actual_start_lba, "size:", size)
+                else:
+                    # CPU -> NVMe (direct)
+                    data_bytes = src_data.numpy().tobytes()
+                    dst.device.nvme_device.write(data_bytes, actual_start_lba)
+                    #dst.device.nvme_device.write_uring(data_bytes, actual_start_lba)
+
+            # BD: NVMe read IO (NVMe -> GPU)
+            elif (src.device.device_type == DeviceType.DISK and 
+                  hasattr(src.device, 'nvme_device') and 
+                  src.name in src.device.tensor_lba_map):
+                
+                lba_info = src.device.tensor_lba_map[src.name]
+                start_lba = lba_info['start_lba']
+
+                # Calculate LBA offset and size using shared function
+                lba_offset, indexed_shape, indexed_bytes = _calculate_lba_offset_and_size(src, src_indices, src.device)
+                actual_start_lba = start_lba + lba_offset
+                
+                # Read data from NVMe
+                data_bytes = src.device.nvme_device.read(indexed_bytes, actual_start_lba)
+                #data_bytes = src.device.nvme_device.read_uring(indexed_bytes, actual_start_lba)
+                
+                # Create tensor with minimal copying
+                src_data = _create_tensor_from_bytes(data_bytes, indexed_shape, src.dtype)
+                
+                dst_data = map_to_torch_tensor(dst, dst_indices)
+                
+                if dst.device.device_type == DeviceType.CUDA:
+                    # NVMe -> Pinned CPU -> GPU
+                    size = np.prod(src_data.shape)
+                    tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+                    tmp_cpu_buf.copy_(src_data)
+                    dst_data.copy_(tmp_cpu_buf)
+
+                    # Read Check (DISK → CUDA)  
+                    if (src.device.device_type == DeviceType.DISK and dst.device.device_type == DeviceType.CUDA):
+                        print("[NVMe Read] src_data shape:", src_data.shape, "lba:", actual_start_lba, "size:", size)
+                else:
+                    # NVMe -> CPU (direct copy)
+                    dst_data.copy_(src_data)
+
+            else:
+                assert False, "This case should not be reached in NVMe copy worker"
 
             queue.task_done()

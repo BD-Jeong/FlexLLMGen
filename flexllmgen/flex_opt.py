@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.opt_config import OptConfig, get_opt_config, download_opt_weights
-from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
+from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchNVMe, TorchLink,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexllmgen.timer import timers
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
@@ -324,6 +324,7 @@ class SelfAttention:
         elif self.policy.cache_cpu_percent == 100:
             device = self.env.cpu
         elif self.policy.cache_disk_percent == 100:
+            print("\033[32mBD: KV cache only used on disk\033[0m")
             device = self.env.disk
         else:
             device = self.env.mixed
@@ -363,8 +364,8 @@ class SelfAttention:
 
             if self.policy.attn_sparsity >= 1.0:
                 cache_read_buf.store((
-                    k_home.smart_copy(dst, indices),
-                    v_home.smart_copy(dst, indices),
+                    k_home.smart_copy(dst, indices), # (KV_Disk_Read) DISK -> GPU
+                    v_home.smart_copy(dst, indices), # (KV_Disk_Read) DISK -> GPU
                 ))
             else:
                 cache_read_buf.store((
@@ -1191,7 +1192,18 @@ def run_flexllmgen(args):
 
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
-    disk = TorchDisk(args.offload_dir)
+    # BD
+    if args.bd_mode == "none":
+        disk = TorchDisk(args.offload_dir)
+    elif args.bd_mode == "file":
+        disk = TorchDisk(args.offload_dir)
+    elif args.bd_mode == "block":
+        disk = TorchNVMe(args.bd_device)
+    elif args.bd_mode == "fdp":
+        disk = TorchDisk(args.offload_dir)
+    else:
+        raise ValueError(f"Invalid BD mode: {args.bd_mode}")
+    
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
 
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
@@ -1220,8 +1232,9 @@ def run_flexllmgen(args):
 
     try:
         print("warmup - generate")
-        output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
+        print("\033[32mBD: warmup - Passed\033[0m")
+        #output_ids = model.generate(
+        #    warmup_inputs, max_new_tokens=2, verbose=args.verbose)
 
         print("benchmark - generate")
         timers("generate").reset()
@@ -1315,6 +1328,10 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+    
+    # BD
+    parser.add_argument("--bd-mode", type=str, default="none") # none, file, block, fdp
+    parser.add_argument("--bd-device", type=str, default="none") # /dev/nvme0n1
 
 
 if __name__ == "__main__":
