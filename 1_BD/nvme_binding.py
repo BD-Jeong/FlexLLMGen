@@ -1,8 +1,12 @@
+from re import U
+import sys
+import os
 import ctypes
+import ctypes.util
 import numpy as np
 import threading
 import time
-from typing import Optional
+from typing import Union, Optional
 
 # Import C extension module
 try:
@@ -27,9 +31,8 @@ class XNVMeNamespace:
         self.lba_nbytes = geo['lba_nbytes']
         self.max_lba = geo['nsect'] - 1
         self.mdts = geo['mdts']
+
         self.nsid = 1
-        # Align MDTS to 4K boundary
-        self.mdts = (self.mdts // 4096) * 4096
         # Calculate max_blocks based on MDTS (Maximum Data Transfer Size)
         self.max_blocks = self.mdts // self.lba_nbytes
         self.queue_depth = 64
@@ -214,7 +217,9 @@ class XNVMeNamespace:
             bytes_this_chunk = blocks_this_chunk * self.lba_nbytes
 
             # Get chunk data
-            chunk_mv = data[data_offset:data_offset + bytes_this_chunk]
+            data_mv = memoryview(data)
+            chunk_mv = data_mv[data_offset:data_offset + bytes_this_chunk]
+            #chunk_data = data_mv[data_offset:data_offset + bytes_this_chunk]
 
             # Let C extension allocate buffer and copy data
             xnvme_core.async_write(queue, self.dev, chunk_mv, self.nsid, current_lba, nlb)
@@ -226,7 +231,7 @@ class XNVMeNamespace:
                 #print(f"[DEBUG][nvme_binding][async_write] queue_poke: completed={completed}")
                 if completed == 0:
                     consecutive_zeros += 1
-                    if consecutive_zeros > 3:  # if 3 consecutive zeros, wait for a short time
+                    if consecutive_zeros > 3:  # 3번 연속 0이면 짧게 대기
                         time.sleep(0.0001)  # 0.1ms
                 else:
                     consecutive_zeros = 0
@@ -285,7 +290,7 @@ class XNVMeNamespace:
                 #print(f"[DEBUG][nvme_binding][async_read] queue_poke: completed={completed}")
                 if completed == 0:
                     consecutive_zeros += 1
-                    if consecutive_zeros > 3:  # if 3 consecutive zeros, wait for a short time
+                    if consecutive_zeros > 3:  # 3번 연속 0이면 짧게 대기
                         time.sleep(0.0001)  # 0.1ms
                 else:
                     consecutive_zeros = 0

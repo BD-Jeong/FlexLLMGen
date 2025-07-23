@@ -1,0 +1,183 @@
+sudo systemd-run --scope --property=MemoryLimit=20G python3 -m flexllmgen.flex_opt \
+--model facebook/opt-6.7b \
+--path _DUMMY_ \
+--offload-dir kv_off \
+--prompt-len 256 \
+--gen-len 8 \
+--num-gpu-batches 1 \
+--percent 20 80 0 0 100 0
+
+sudo sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"
+
+# thread 4
+sudo systemd-run --scope --property=MemoryLimit=9G python3 -m flexllmgen.flex_opt \
+--model facebook/opt-1.3b \
+--path _DUMMY_ \
+--offload-dir kv_off \
+--prompt-len 1024 \
+--gen-len 8 \
+--gpu-batch-size 1 \
+--percent 100 0 0 0 100 0
+
+# thread 1
+sudo systemd-run --scope --property=MemoryLimit=2.4G python3 -m flexllmgen.flex_opt \
+--model facebook/opt-1.3b \
+--path _DUMMY_ \
+--offload-dir kv_off \
+--prompt-len 1024 \
+--gen-len 8 \
+--gpu-batch-size 1 \
+--percent 100 0 0 0 100 0
+
+# thread 1 batch 8
+sudo systemd-run --scope --property=MemoryLimit=2.4G python3 -m flexllmgen.flex_opt \
+--model facebook/opt-1.3b \
+--path _DUMMY_ \
+--offload-dir kv_off \
+--prompt-len 1024 \
+--gen-len 8 \
+--gpu-batch-size 8 \
+--percent 100 0 0 0 100 0
+
+# thread 4 batch 8
+sudo systemd-run --scope --property=MemoryLimit=8G python3 -m flexllmgen.flex_opt \
+--model facebook/opt-1.3b \
+--path _DUMMY_ \
+--offload-dir kv_off \
+--prompt-len 1024 \
+--gen-len 8 \
+--gpu-batch-size 8 \
+--percent 100 0 0 0 100 0
+
+# Percent 의미
+w_gpu_percent: 모델 가중치(weights)를 GPU에 할당할 비율
+w_cpu_percent: 모델 가중치를 CPU에 할당할 비율
+cache_gpu_percent: KV cache를 GPU에 할당할 비율
+cache_cpu_percent: KV cache를 CPU에 할당할 비율
+act_gpu_percent: 활성화값(activations)을 GPU에 할당할 비율
+act_cpu_percent: 활성화값을 CPU에 할당할 비율
+
+# blktrace
+sudo blktrace -d /dev/nvme1n1 -o nvme_trace -w 60
+sudo blkparse -i nvme_trace.blktrace.* > nvme_trace.txt
+
+# 커널 timeout?
+sudo sysctl -w kernel.sched_rt_runtime_us=-1
+sudo sysctl -w kernel.watchdog_thresh=60
+
+
+
+#
+mkfs -t ext4 /dev/nvme1n1
+mount /dev/nvme1n1 kv_off
+
+
+
+# Type2 - block access
+sudo systemd-run --scope --property=MemoryLimit=2.4G \
+env PYTHONPATH=/home/bd/FlexLLMGen/flexllmgen:$PYTHONPATH \
+python3 -m flexllmgen.flex_opt \
+--model facebook/opt-1.3b \
+--prompt-len 1024 \
+--gen-len 32 \
+--gpu-batch-size 8 \
+--percent 100 0 0 0 100 0 \
+--bd-mode block \
+--bd-device /dev/ng1n1
+
+-> 
+----------------------------------------------------------------------
+0: Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city
+----------------------------------------------------------------------
+7: Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city
+----------------------------------------------------------------------
+
+TorchDevice: cuda:0
+  cur_mem: 2.6505 GB,  peak_mem: 3.8468 GB
+TorchDevice: cpu
+  cur_mem: 0.0000 GB,  peak_mem: 0.0000 GB
+model size: 2.443 GB    cache size: 1.547 GB    hidden size (p): 0.032 GB
+peak gpu mem: 3.847 GB  projected: False
+prefill latency: 5.981 s        prefill throughput: 1369.741 token/s
+decode latency: 110.826 s       decode throughput: 2.238 token/s
+total latency: 116.807 s        total throughput: 2.192 token/s
+
+
+
+# file
+sudo nvme reset /dev/nvme1
+sudo blkdiscard /dev/nvme1n1
+sudo wipefs -a /dev/nvme1n1
+mkfs -t ext4 /dev/nvme1n1
+mount /dev/nvme1n1 kv_off
+sudo nvme format /dev/nvme1n1 --ses=1 --force
+sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+sudo systemd-run --scope --property=MemoryLimit=2.4G \
+env PYTHONPATH=/home/bd/FlexLLMGen/flexllmgen:$PYTHONPATH \
+python3 -m flexllmgen.flex_opt \
+--model facebook/opt-1.3b \
+--prompt-len 1024 \
+--gen-len 32 \
+--gpu-batch-size 8 \
+--percent 100 0 0 0 100 0 \
+--offload-dir kv_off 
+
+-> 
+----------------------------------------------------------------------
+0: Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city
+----------------------------------------------------------------------
+7: Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city
+----------------------------------------------------------------------
+
+TorchDevice: cuda:0
+  cur_mem: 2.6505 GB,  peak_mem: 3.8468 GB
+TorchDevice: cpu
+  cur_mem: 0.0000 GB,  peak_mem: 0.0000 GB
+model size: 2.443 GB    cache size: 1.547 GB    hidden size (p): 0.032 GB
+peak gpu mem: 3.847 GB  projected: False
+prefill latency: 7.901 s        prefill throughput: 1036.777 token/s
+decode latency: 81.166 s        decode throughput: 3.055 token/s
+total latency: 89.068 s total throughput: 2.874 token/s
+
+
+
+
+/usr/local/lib/python3.12/dist-packages/torch/__init__.py:1117: FutureWarning: `torch.distributed.reduce_op` is deprecated, please use `torch.distributed.ReduceOp` instead
+  return isinstance(obj, torch.Tensor)
+Outputs:
+----------------------------------------------------------------------
+0: Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe, after London.
+
+Paris is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe, after London.
+
+Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe, after London.
+
+Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe, after London.
+
+Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe, after London.
+
+Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe
+----------------------------------------------------------------------
+7: Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe, after London.
+
+Paris is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe, after London.
+
+Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe, after London.
+
+Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe, after London.
+
+Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe, after London.
+
+Paris is the capital city of France. It is the most populous city in France, with an estimated population of 6,848,000 in 2016. It is the second most populous city in Europe
+----------------------------------------------------------------------
+
+TorchDevice: cuda:0
+  cur_mem: 2.6505 GB,  peak_mem: 2.8579 GB
+TorchDevice: cpu
+  cur_mem: 0.0000 GB,  peak_mem: 0.0000 GB
+model size: 2.443 GB    cache size: 0.750 GB    hidden size (p): 0.016 GB
+peak gpu mem: 2.858 GB  projected: False
+prefill latency: 2.032 s        prefill throughput: 1007.833 token/s
+decode latency: 259.142 s       decode throughput: 7.872 token/s
+total latency: 261.174 s        total throughput: 7.842 token/s

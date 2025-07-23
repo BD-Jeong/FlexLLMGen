@@ -1,0 +1,21 @@
+# GPU
+sudo ubuntu-drivers devices
+sudo ubuntu-drivers autoinstall
+
+# FlexGen
+git clone https://github.com/BD-Jeong/FlexLLMGen.git
+cd FlexLLMGen
+pip install -e .
+
+# io uring install
+sudo apt install liburing-dev
+
+# xNVMe
+sudo rm -rf builddir && mkdir builddir && cd builddir
+sudo meson setup build -Dwith-liburing=enabled
+sudo ninja -C build
+sudo ninja install
+
+
+# C extention module build
+python3 setup_xnvme_core.py build_ext --inplace

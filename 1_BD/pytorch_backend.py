@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import numpy as np
 import sys
 
+# BD
 #import xnvme
 from flexllmgen.nvme_binding import XNVMeNamespace as NVMeDevice
 
@@ -719,6 +720,7 @@ class TorchNVMe:
             start_lba = lba_info['start_lba']
             num_blocks = lba_info['num_blocks']
             
+            # TRIM the blocks to free them using the xNVMe API
             self.nvme_device.trim(start_lba, num_blocks)
             print(f"\033[32mBD: NVMe TRIM\033[0m LBA {start_lba}, blocks {num_blocks}")
             
@@ -1143,12 +1145,7 @@ def copy_worker_func_nvme(queue, cuda_id):
     """The copy worker thread for NVMe direct access."""
     torch.cuda.set_device(cuda_id)
 
-    # 4k aligned pinned buffer
-    ALIGN = 4096
-    BUFFER_SIZE = 1 * GB
-    aligned_size = (BUFFER_SIZE + ALIGN - 1) & ~(ALIGN - 1)
-    cpu_buf = torch.empty((aligned_size,), dtype=torch.float16, pin_memory=True)
-    
+    cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
     copy_stream = torch.cuda.Stream()
 
     with torch.cuda.stream(copy_stream):
@@ -1158,8 +1155,9 @@ def copy_worker_func_nvme(queue, cuda_id):
                 queue.task_done()
                 return
             
-            dst, dst_indices, src, src_indices = item            
-
+            dst, dst_indices, src, src_indices = item
+            
+            # 공통 조건 체크
             is_nvme_write = (dst.device.device_type == DeviceType.DISK and 
                            hasattr(dst.device, 'nvme_device') and 
                            dst.name in dst.device.tensor_lba_map)
@@ -1169,37 +1167,41 @@ def copy_worker_func_nvme(queue, cuda_id):
                           src.name in src.device.tensor_lba_map)
             
             if is_nvme_write:
+                # Write 로직
                 actual_start_lba, _, _ = _get_nvme_lba_info(dst, dst.device, dst_indices)
                 src_data = map_to_torch_tensor(src, src_indices)
                 
                 if src.device.device_type == DeviceType.CUDA:
-                    # GPU -> Pinned Buffer -> NVMe
+                    # GPU -> Pinned CPU -> NVMe
                     size = np.prod(src_data.shape)
                     tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
                     tmp_cpu_buf.copy_(src_data)
-                    assert tmp_cpu_buf.data_ptr() % ALIGN == 0, "[NVMe Write] tmp_cpu_buf must be 4k aligned"
                     data_mv = memoryview(tmp_cpu_buf.numpy()).cast('B')
-                    dst.device.nvme_device.async_write(data_mv, actual_start_lba)
-                    # Write Check
-                    print("[NVMe Write] src_data shape:", tmp_cpu_buf.shape, "lba:", actual_start_lba, "size:", size)
                 else:
-                    assert False, "not implemented yet"
-                    # CPU -> NVMe
-                    #data_bytes = src_data.numpy().tobytes()
+                    # CPU -> NVMe (direct)
+                    data_bytes = src_data.numpy().tobytes()
+
+                # Write Check 
+                print("[NVMe Write] src_data shape:", tmp_cpu_buf.shape, "lba:", actual_start_lba, "size:", size)
+                dst.device.nvme_device.async_write(data_mv, actual_start_lba)
                 
             elif is_nvme_read:
-                # NVMe -> NVMe Buffer -> GPU
+                # Read 로직
                 actual_start_lba, indexed_shape, indexed_bytes = _get_nvme_lba_info(src, src.device, src_indices)
                 data_bytes, buf_ptr = src.device.nvme_device.async_read(indexed_bytes, actual_start_lba, dtype=torch_dtype_to_np_dtype[src.dtype])
-                src_data = torch.frombuffer(data_bytes, dtype=src.dtype).reshape(indexed_shape)
+                src_data = torch.frombuffer(data_bytes, dtype=src.dtype).reshape(indexed_shape)#.cuda()
+                #size = np.prod(src_data.shape)
+                #tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+                #tmp_cpu_buf.copy_(src_data)
                 dst_data = map_to_torch_tensor(dst, dst_indices)
+                
                 # Read Check
                 print("[NVMe Read] src_data shape:", src_data.shape, "lba:", actual_start_lba, "size:", indexed_bytes)
 
                 if dst.device.device_type == DeviceType.CUDA:
                     dst_data.copy_(src_data)
                 else:
-                    assert False, "not implemented yet"
+                    dst_data.copy_(src_data)
 
                 done_evt = torch.cuda.Event()
                 done_evt.record(stream=copy_stream)
@@ -1208,8 +1210,9 @@ def copy_worker_func_nvme(queue, cuda_id):
                     evt.synchronize()
                     if hasattr(device, 'nvme_device'):
                         device.nvme_device.free_buffer(ptr)
+                        print("[NVMe Read] Free buffer done")
                     else:
-                        assert False, "device is not TorchNVMe"
+                        print("[NVMe Read] Warning: device is not TorchNVMe")
 
                 threading.Thread(target=_free_after, args=(done_evt, buf_ptr, src.device)).start()
 

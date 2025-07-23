@@ -1331,7 +1331,7 @@ def add_parser_arguments(parser):
     
     # BD
     parser.add_argument("--bd-mode", type=str, default="none") # none, file, block, fdp
-    parser.add_argument("--bd-device", type=str, default="none") # /dev/nvme0n1
+    parser.add_argument("--bd-device", type=str, default="none") # /dev/nvme1n1
 
 
 if __name__ == "__main__":

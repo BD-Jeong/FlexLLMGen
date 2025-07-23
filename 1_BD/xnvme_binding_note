@@ -1,0 +1,130 @@
+# xNVMe Python 바인딩 직접 생성 및 FlexLLMGen 연동 가이드
+
+## 1. xNVMe 소스 클론 및 의존성 설치
+
+```bash
+# 1. xNVMe 소스 클론
+git clone https://github.com/OpenMPDK/xNVMe.git
+cd xNVMe
+
+# 2. 빌드에 필요한 패키지 설치 (예시: Ubuntu)
+sudo apt update
+sudo apt install -y python3-pip python3-venv clang llvm libclang-dev
+
+# 3. Python 패키지 설치
+cd python/bindings
+python3 -m venv .build-py-env
+source .build-py-env/bin/activate
+pip install -r requirements.txt
+```
+
+---
+
+## 2. ctypes 바인딩 생성 (clang2py 사용)
+
+1. **헤더 파일에 표준 C 헤더 추가**
+   - 각 `include/libxnvme_*.h` 파일 맨 위에 아래 줄이 모두 들어가야 함:
+     ```c
+     #include <stdint.h>
+     #include <stddef.h>
+     #include <stdbool.h>
+     #include <stdio.h>
+     ```
+
+2. **바인딩 생성**
+   - `python/bindings/Makefile`의 `XNVME_CAPI_HEADERS` 변수에 아래처럼 필요한 헤더만 나열:
+     ```
+     XNVME_CAPI_HEADERS = \
+       ../../include/libxnvme.h \
+       ../../include/libxnvme_nvm.h \
+       ../../include/libxnvme_dev.h \
+       ../../include/libxnvme_buf.h \
+       ../../include/libxnvme_file.h \
+       ../../include/libxnvme_geo.h \
+       ../../include/libxnvme_znd.h \
+       ../../include/libxnvme_spec.h \
+       ../../include/libxnvme_ident.h
+     ```
+   - 바인딩 생성:
+     ```bash
+     make build
+     ```
+
+---
+
+## 3. 바인딩 패키지 구조 확인 및 보완
+
+- `python/bindings/xnvme/` 폴더에 반드시 `__init__.py` 파일이 있어야 함:
+  ```python
+  # xNVMe/python/bindings/xnvme/__init__.py
+  from .ctypes_bindings import *
+  ```
+- `ctypes_bindings/` 폴더에도 `__init__.py`가 있어야 함.
+
+- `api.py`에 아래 함수가 반드시 있어야 함(ImportError 방지):
+  ```python
+  def guard_unloadable():
+      pass
+
+  def is_loaded():
+      return True
+  ```
+
+---
+
+## 4. 시스템에 PyPI xnvme 패키지 설치되어 있다면 **반드시 삭제**
+```bash
+sudo pip3 uninstall xnvme
+sudo rm -rf /usr/local/lib/python3.8/dist-packages/xnvme*
+```
+
+---
+
+## 5. FlexLLMGen에서 바인딩 사용
+
+- FlexLLMGen 실행 시, **PYTHONPATH**를 바인딩 경로로 지정:
+  ```bash
+  export PYTHONPATH=/path/to/xNVMe/python/bindings:$PYTHONPATH
+  # 또는 systemd-run 등으로 실행 시
+  sudo systemd-run --scope --property=MemoryLimit=2.4G \
+    env PYTHONPATH=/path/to/xNVMe/python/bindings:$PYTHONPATH \
+    python3 -m flexllmgen.flex_opt ... (이하 생략)
+  ```
+
+---
+
+## 6. 바인딩 함수 시그니처 주의
+
+- `xnvme_dev_open(uri, opts)`의 두 번째 인자는 **반드시 None**을 넘겨야 함 (`LP_xnvme_opts` 포인터 타입)
+  ```python
+  dev = xnvme.xnvme_dev_open(uri.encode(), None)
+  ```
+
+---
+
+## 7. 정상 동작 확인
+
+- 아래 명령어로 직접 만든 바인딩이 import되는지 확인:
+  ```bash
+  python3 -c "import xnvme; print(xnvme.__file__)"
+  ```
+  → `/path/to/xNVMe/python/bindings/xnvme/__init__.py`가 출력되어야 함
+
+---
+
+## 8. (선택) 바인딩 import 에러 발생 시 체크리스트
+
+- PYTHONPATH가 올바른지
+- 시스템 site-packages에 xnvme가 남아있지 않은지
+- `__init__.py` 파일이 누락되지 않았는지
+- 바인딩 생성 시 헤더에 표준 C 헤더가 모두 포함되어 있는지
+
+---
+
+## 9. (선택) 바인딩 재생성시
+
+- 헤더 추가/수정 후 `make build`만 다시 실행하면 됨
+
+---
+
+### 이 가이드만 따라하면, **다른 머신에서도 동일하게 xNVMe 바인딩을 직접 생성해 FlexLLMGen에서 사용할 수 있습니다!**

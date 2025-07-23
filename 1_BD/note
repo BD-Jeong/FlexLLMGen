@@ -1,0 +1,84 @@
+* libnvme 환경
+git clone https://github.com/linux-nvme/libnvme.git
+cd libnvme
+meson setup build
+ninja -C build
+sudo ninja -C build install
+
+* python binding 설치
+pip install libnvme
+
+* binding
+cd ..
+pip install .
+
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+echo "/usr/lib/x86_64-linux-gnu" | sudo tee /etc/ld.so.conf.d/nvme.conf
+sudo ldconfig
+
+
+
+# Clone the xNVMe repos
+git clone https://github.com/xnvme/xnvme.git
+cd xnvme
+
+# Install toolchain and libraries on Linux (Debian Bookworm)
+sudo ./toolbox/pkgs/debian-bookworm.sh
+
+# configure xNVMe and build meson subprojects(SPDK)
+meson setup builddir
+
+# build xNVMe
+meson compile -C builddir
+
+# install xNVMe
+sudo meson install -C builddir
+
+# uninstall xNVMe
+# cd builddir && meson --internal uninstall
+
+python3 -m pip install xnvme --user
+
+pip install pipx
+python3 -m pip install pipx
+
+pip install virtualenv clang2py
+python3 -m pip install virtualenv clang2py
+
+sudo apt-get update
+sudo apt-get install libclang-dev
+
+python3 aux/patch_ctypes_mapping.py xnvme/ctypes_bindings/api.py
+
+python3 patch_ctypes_bindings.py --path /home/bd/flexgen/FlexLLMGen/xnvme/python/bindings/xnvme/ctypes_bindings/api.py
+
+clang2py \
+  ../../include/libxnvme_adm.h \
+  ../../include/libxnvme_be.h \
+  ../../include/libxnvme_buf.h \
+  ../../include/libxnvme_cli.h \
+  ../../include/libxnvme_cmd.h \
+  ../../include/libxnvme_dev.h \
+  ../../include/libxnvme_file.h \
+  ../../include/libxnvme_geo.h \
+  ../../include/libxnvme.h \
+  ../../include/libxnvme_ident.h \
+  ../../include/libxnvme_kvs.h \
+  ../../include/libxnvme_lba.h \
+  ../../include/libxnvme_libconf.h \
+  ../../include/libxnvme_mem.h \
+  ../../include/libxnvme_nvm.h \
+  ../../include/libxnvme_opts.h \
+  ../../include/libxnvme_pi.h \
+  ../../include/libxnvme_pp.h \
+  ../../include/libxnvme_queue.h \
+  ../../include/libxnvme_spec_fs.h \
+  ../../include/libxnvme_spec.h \
+  ../../include/libxnvme_spec_pp.h \
+  ../../include/libxnvme_topology.h \
+  ../../include/libxnvme_ver.h \
+  ../../include/libxnvme_znd.h \
+  --clang-args="-I../../include -I/usr/include -I/usr/include/linux -I/usr/include/x86_64-linux-gnu" \
+  > xnvme/ctypes_bindings/api.py
+
+  apt install clang

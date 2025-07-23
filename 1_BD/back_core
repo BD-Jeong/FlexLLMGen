@@ -1,0 +1,645 @@
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+#include <libxnvme.h>
+#include <string.h>
+#include <numpy/arrayobject.h>
+
+// Python 모듈 정의
+static PyObject* xnvme_core_open_device(PyObject* self, PyObject* args) {
+    const char* device_path;
+    int use_io_uring;
+    
+    if (!PyArg_ParseTuple(args, "si", &device_path, &use_io_uring)) {
+        return NULL;
+    }
+    
+    struct xnvme_dev* dev;
+    
+    if (use_io_uring) {
+        // io_uring 백엔드로 디바이스 열기 (공식 문서에 따름)
+        struct xnvme_opts opts = {0};
+        opts.sync = "nvme";
+        opts.async = "io_uring_cmd";
+        dev = xnvme_dev_open(device_path, &opts);
+    } else {
+        // 기본 백엔드로 디바이스 열기
+        dev = xnvme_dev_open(device_path, NULL);
+    }
+    
+    if (!dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to open device");
+        return NULL;
+    }
+    const struct xnvme_opts *opts = xnvme_dev_get_opts(dev);
+    printf("async backend: %s\n", opts->async);
+    
+    // 디바이스 포인터를 Python long으로 반환
+    return PyLong_FromVoidPtr(dev);
+}
+
+static PyObject* xnvme_core_close_device(PyObject* self, PyObject* args) {
+    PyObject* dev_ptr_obj;
+    
+    if (!PyArg_ParseTuple(args, "O", &dev_ptr_obj)) {
+        return NULL;
+    }
+    
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (dev) {
+        xnvme_dev_close(dev);
+    }
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject* xnvme_core_get_geometry(PyObject* self, PyObject* args) {
+    PyObject* dev_ptr_obj;
+    
+    if (!PyArg_ParseTuple(args, "O", &dev_ptr_obj)) {
+        return NULL;
+    }
+    
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (!dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid device pointer");
+        return NULL;
+    }
+    
+    const struct xnvme_geo* geo = xnvme_dev_get_geo(dev);
+    if (!geo) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to get geometry");
+        return NULL;
+    }
+    
+    // Python 딕셔너리로 geometry 정보 반환
+    PyObject* result = PyDict_New();
+    PyDict_SetItemString(result, "nbytes", PyLong_FromUnsignedLong(geo->nbytes));
+    PyDict_SetItemString(result, "nbytes_oob", PyLong_FromUnsignedLong(geo->nbytes_oob));
+    PyDict_SetItemString(result, "lba_nbytes", PyLong_FromUnsignedLong(geo->lba_nbytes));
+    PyDict_SetItemString(result, "lba_extended", PyLong_FromUnsignedLong(geo->lba_extended));
+    PyDict_SetItemString(result, "type", PyLong_FromUnsignedLong(geo->type));
+    PyDict_SetItemString(result, "nsect", PyLong_FromUnsignedLong(geo->nsect));
+    
+    return result;
+}
+
+static PyObject* xnvme_core_sync_write(PyObject* self, PyObject* args) {
+    PyObject* dev_ptr_obj;
+    uint32_t nsid;
+    uint64_t lba;
+    uint16_t nlb;
+    const char* data;
+    Py_ssize_t data_len;
+    
+    if (!PyArg_ParseTuple(args, "OIKHs#", &dev_ptr_obj, &nsid, &lba, &nlb, &data, &data_len)) {
+        return NULL;
+    }
+    
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (!dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid device pointer");
+        return NULL;
+    }
+    
+    // 버퍼 할당 및 데이터 복사
+    size_t buf_size = (nlb + 1) * xnvme_dev_get_geo(dev)->lba_nbytes;
+    void* buf = xnvme_buf_alloc(dev, buf_size);
+    if (!buf) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to allocate buffer");
+        return NULL;
+    }
+    
+    memcpy(buf, data, data_len);
+    
+    // Command context 생성
+    struct xnvme_cmd_ctx ctx = xnvme_cmd_ctx_from_dev(dev);
+    
+    // 디버깅 출력 추가
+    printf("[DEBUG][SYNC_WRITE] LBA=%lu, nlb=%u, buf_size=%zu, data_len=%zd\n", 
+           lba, nlb, buf_size, data_len);
+    
+    // 쓰기 명령 실행 - nlb를 그대로 사용 (zero-based가 아님)
+    int err = xnvme_nvm_write(&ctx, nsid, lba, nlb, buf, NULL);
+    if (err || xnvme_cmd_ctx_cpl_status(&ctx)) {
+        printf("[DEBUG][SYNC_WRITE] FAILED: err=%d, status=%d\n", err, xnvme_cmd_ctx_cpl_status(&ctx));
+        xnvme_buf_free(dev, buf);
+        PyErr_SetString(PyExc_RuntimeError, "Write command failed");
+        return NULL;
+    }
+    
+    printf("[DEBUG][SYNC_WRITE] SUCCESS: LBA=%lu, nlb=%u\n", lba, nlb);
+    
+    // 버퍼 해제
+    xnvme_buf_free(dev, buf);
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject* xnvme_core_sync_read(PyObject* self, PyObject* args) {
+    PyObject* dev_ptr_obj;
+    uint32_t nsid;
+    uint64_t lba;
+    uint16_t nlb;
+    
+    if (!PyArg_ParseTuple(args, "OIKH", &dev_ptr_obj, &nsid, &lba, &nlb)) {
+        return NULL;
+    }
+    
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (!dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid device pointer");
+        return NULL;
+    }
+    
+    // 버퍼 할당 - nlb+1을 사용하여 실제 블록 수 계산
+    size_t buf_size = (nlb + 1) * xnvme_dev_get_geo(dev)->lba_nbytes;
+    void* buf = xnvme_buf_alloc(dev, buf_size);
+    if (!buf) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to allocate buffer");
+        return NULL;
+    }
+    
+    // Command context 생성
+    struct xnvme_cmd_ctx ctx = xnvme_cmd_ctx_from_dev(dev);
+    
+    // 디버깅 출력 추가
+    printf("[DEBUG][SYNC_READ] LBA=%lu, nlb=%u, buf_size=%zu\n", lba, nlb, buf_size);
+    
+    // 읽기 명령 실행
+    int err = xnvme_nvm_read(&ctx, nsid, lba, nlb, buf, NULL);
+    if (err || xnvme_cmd_ctx_cpl_status(&ctx)) {
+        printf("[DEBUG][SYNC_READ] FAILED: err=%d, status=%d\n", err, xnvme_cmd_ctx_cpl_status(&ctx));
+        xnvme_buf_free(dev, buf);
+        PyErr_SetString(PyExc_RuntimeError, "Read command failed");
+        return NULL;
+    }
+    
+    printf("[DEBUG][SYNC_READ] SUCCESS: LBA=%lu, nlb=%u, read_size=%zu\n", lba, nlb, buf_size);
+    
+    // 데이터를 Python bytes로 변환
+    PyObject* result = PyBytes_FromStringAndSize(buf, buf_size);
+    
+    // 버퍼 해제
+    xnvme_buf_free(dev, buf);
+    
+    return result;
+}
+
+static PyObject* xnvme_core_trim(PyObject* self, PyObject* args) {
+    PyObject* dev_ptr_obj;
+    uint32_t nsid;
+    uint64_t lba;
+    uint16_t nlb;
+    
+    if (!PyArg_ParseTuple(args, "OIKH", &dev_ptr_obj, &nsid, &lba, &nlb)) {
+        return NULL;
+    }
+    
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (!dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid device pointer");
+        return NULL;
+    }
+    
+    // Command context 생성
+    struct xnvme_cmd_ctx ctx = xnvme_cmd_ctx_from_dev(dev);
+    
+    // DSM range 구조체 생성 (실제 TRIM 명령)
+    struct xnvme_spec_dsm_range dsm_range = {0};
+    dsm_range.cattr = 0;  // Context attributes (0 for TRIM)
+    dsm_range.llb = nlb;  // Number of logical blocks
+    dsm_range.slba = lba; // Starting LBA
+    
+    // TRIM 명령 실행 (DSM - Dataset Management)
+    int err = xnvme_nvm_dsm(&ctx, nsid, &dsm_range, 1, true, false, false);
+    if (err || xnvme_cmd_ctx_cpl_status(&ctx)) {
+        PyErr_SetString(PyExc_RuntimeError, "TRIM command failed");
+        return NULL;
+    }
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject* xnvme_core_create_queue(PyObject* self, PyObject* args) {
+    PyObject* dev_ptr_obj;
+    uint32_t qdepth;
+    
+    if (!PyArg_ParseTuple(args, "OI", &dev_ptr_obj, &qdepth)) {
+        return NULL;
+    }
+    
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (!dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid device pointer");
+        return NULL;
+    }
+    
+    // 큐 생성
+    struct xnvme_queue* queue = NULL;
+    int err = xnvme_queue_init(dev, qdepth, 0, &queue);
+    if (err || !queue) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to create queue");
+        return NULL;
+    }
+    
+    // 큐 포인터를 Python long으로 반환
+    return PyLong_FromVoidPtr(queue);
+}
+
+static PyObject* xnvme_core_destroy_queue(PyObject* self, PyObject* args) {
+    PyObject* queue_ptr_obj;
+    
+    if (!PyArg_ParseTuple(args, "O", &queue_ptr_obj)) {
+        return NULL;
+    }
+    
+    struct xnvme_queue* queue = (struct xnvme_queue*)PyLong_AsVoidPtr(queue_ptr_obj);
+    if (queue) {
+        xnvme_queue_term(queue);
+    }
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject* xnvme_core_free_buffer(PyObject* self, PyObject* args) {
+    PyObject* dev_ptr_obj;
+    PyObject* buf_ptr_obj;
+    
+    if (!PyArg_ParseTuple(args, "OO", &dev_ptr_obj, &buf_ptr_obj)) {
+        return NULL;
+    }
+    
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    void* buf = PyLong_AsVoidPtr(buf_ptr_obj);
+    
+    if (dev && buf) {
+        // 버퍼 해제 (태그는 읽기 버퍼에만 있음)
+        printf("[DEBUG][FREE]  buf_ptr=%p\n", buf);
+        xnvme_buf_free(dev, buf);
+    }
+    
+    Py_RETURN_NONE;
+}
+
+// 진짜 async batch 처리를 위한 새로운 함수들
+static PyObject* xnvme_core_create_async_queue(PyObject* self, PyObject* args) {
+    PyObject* dev_ptr_obj;
+    int queue_depth;
+    
+    if (!PyArg_ParseTuple(args, "Oi", &dev_ptr_obj, &queue_depth)) {
+        return NULL;
+    }
+    
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (!dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid device pointer");
+        return NULL;
+    }
+    struct xnvme_queue* queue = NULL;
+    int err = xnvme_queue_init(dev, queue_depth, 0, &queue);
+    if (err || !queue) {
+        printf("Failed to create queue: err=%d, queue=%p\n", err, queue);
+        PyErr_SetString(PyExc_RuntimeError, "Failed to create async queue");
+        return NULL;
+    }
+    return PyLong_FromVoidPtr(queue);
+}
+
+// 비동기 쓰기 완료 콜백 함수
+static void write_cb(struct xnvme_cmd_ctx *ctx, void *cb_arg) {
+    printf("[DEBUG][WRITE_CB] Completed write to LBA: %lu, status: %d (0x%02x)\n", 
+           ctx->cmd.nvm.slba, ctx->cpl.status.sc, ctx->cpl.status.sc);
+    
+    if (ctx->cpl.status.sc) {
+        fprintf(stderr, "[DEBUG][WRITE_CB] Write failed! status: %d (0x%02x)\n", 
+                ctx->cpl.status.sc, ctx->cpl.status.sc);
+        fprintf(stderr, "[DEBUG][WRITE_CB] Command details: nsid=%u, slba=%lu, nlb=%u\n",
+                ctx->cmd.common.nsid, ctx->cmd.nvm.slba, ctx->cmd.nvm.nlb);
+    }
+    
+    // 버퍼 자동 해제
+    //if (ctx->cmd.common.dptr.prp.prp1) {
+    //    printf("[DEBUG][WRITE_CB] Freeing buffer: %p\n", (void*)ctx->cmd.common.dptr.prp.prp1);
+    //    xnvme_buf_free(ctx->dev, cb_arg); //(void*)ctx->cmd.common.dptr.prp.prp1);
+    //}
+    if (cb_arg) {
+        printf("[DEBUG][WRITE_CB] Freeing buffer (cb_arg): %p\n", cb_arg);
+        xnvme_buf_free(ctx->dev, cb_arg);
+    }
+}
+
+// 비동기 읽기 완료 콜백 함수
+static void read_cb(struct xnvme_cmd_ctx *ctx, void *cb_arg) {
+    printf("[DEBUG][READ_CB] Completed read from LBA: %lu, status: %d\n", 
+           ctx->cmd.nvm.slba, ctx->cpl.status.sc);
+    if (ctx->cpl.status.sc) {
+        fprintf(stderr, "[DEBUG][READ_CB] Read failed! status: %d\n", ctx->cpl.status.sc);
+    }
+    
+    // 버퍼 자동 해제
+    if (cb_arg) {
+        printf("[DEBUG][WRITE_CB] Freeing buffer (cb_arg): %p\n", cb_arg);
+        xnvme_buf_free(ctx->dev, cb_arg);
+    }
+}
+
+static PyObject* xnvme_core_queue_write_command(PyObject* self, PyObject* args) {
+    PyObject* queue_ptr_obj;
+    PyObject* dev_ptr_obj;
+    uint32_t nsid;
+    uint64_t lba;
+    uint16_t nlb;
+    const char* data;
+    Py_ssize_t data_len;
+    
+    if (!PyArg_ParseTuple(args, "OOIKHs#", &queue_ptr_obj, &dev_ptr_obj, &nsid, &lba, &nlb, &data, &data_len)) {
+        return NULL;
+    }
+    
+    struct xnvme_queue* queue = (struct xnvme_queue*)PyLong_AsVoidPtr(queue_ptr_obj);
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (!queue || !dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid queue or device pointer");
+        return NULL;
+    }
+
+    //
+    uint32_t actual_nsid = xnvme_dev_get_nsid(dev);
+    if (nsid != actual_nsid) {
+        fprintf(stderr, "[WARNING][WRITE] nsid mismatch: passed=%u, actual=%u\n", nsid, actual_nsid);
+    }
+    
+    const struct xnvme_geo* geo = xnvme_dev_get_geo(dev);
+    // BD: check lba out of bounds
+    uint64_t max_lba = geo->tbytes / geo->lba_nbytes;
+    if ((lba + nlb) >= max_lba) {
+        fprintf(stderr, "[ERROR][WRITE] LBA out of bounds: lba=%lu, nlb=%u, max_lba=%lu\n",
+                lba, nlb, max_lba);
+        //xnvme_buf_free(dev, buf);
+        PyErr_SetString(PyExc_ValueError, "LBA out of bounds");
+        return NULL;
+    }
+
+    size_t buf_size = (nlb + 1) * geo->lba_nbytes;
+    void* buf = xnvme_buf_alloc(dev, buf_size);
+    if (!buf) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to allocate buffer");
+        return NULL;
+    }
+    
+    // 실제 데이터를 버퍼에 직접 복사
+    memcpy(buf, data, data_len);
+    // BD: check data_len > buf_size
+    if ((size_t)data_len > buf_size) {
+        fprintf(stderr, "[ERROR][WRITE] data_len (%zd) > buf_size (%zu)\n", data_len, buf_size);
+        xnvme_buf_free(dev, buf);
+        PyErr_SetString(PyExc_ValueError, "Data too long for buffer");
+        return NULL;
+    }
+    
+    
+    // 디버깅 출력
+    printf("[DEBUG][WRITE] LBA=%lu, nlb=%u, buf_size=%zu, data_len=%zd, data[0:8]=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+        lba, nlb, buf_size, data_len,
+        (unsigned char)data[0], (unsigned char)data[1], (unsigned char)data[2], (unsigned char)data[3],
+        (unsigned char)data[4], (unsigned char)data[5], (unsigned char)data[6], (unsigned char)data[7]);
+    printf("[DEBUG][ALLOC] buf_ptr=%p for LBA=%lu\n", buf, lba);
+    
+    // 큐를 사용한 비동기 쓰기
+    struct xnvme_cmd_ctx* ctx = xnvme_queue_get_cmd_ctx(queue);
+    if (!ctx) {
+        printf("[DEBUG][WRITE] Failed to get command context from queue\n");
+        xnvme_buf_free(dev, buf);
+        PyErr_SetString(PyExc_RuntimeError, "Failed to get command context");
+        return NULL;
+    }
+    
+    // 콜백 등록
+    ctx->async.cb = write_cb;
+    ctx->async.cb_arg = buf;
+
+    ctx->cmd.common.opcode = 0x01;  // XNVME_SPEC_NVM_OPC_WRITE
+    ctx->cmd.common.nsid = nsid;
+    ctx->cmd.nvm.slba = lba;
+    ctx->cmd.nvm.nlb = nlb;
+    
+    printf("[DEBUG][WRITE] Submitting command: nsid=%u, slba=%lu, nlb=%u, buf=%p\n",
+           nsid, lba, nlb, buf);
+    
+    /*
+           int err = xnvme_nvm_write(ctx, nsid, lba, nlb, buf, NULL);
+    if (err) {
+        printf("[DEBUG][WRITE] Write failed: err=%d\n", err);
+        //xnvme_queue_put_cmd_ctx(queue, ctx);
+        xnvme_buf_free(dev, buf);
+        PyErr_SetString(PyExc_RuntimeError, "Failed to write data");
+        return NULL;
+    }
+    */
+
+    int err = xnvme_cmd_pass_admin(ctx, buf, nlb * geo->lba_nbytes, NULL, 0); 
+    if (err || xnvme_cmd_ctx_cpl_status(&ctx)) {
+        xnvme_cmd_ctx_pr(&ctx, XNVME_PR_DEF);
+        fprintf(stderr, "write failed: %d / sts=0x%x\n",
+                err, xnvme_cmd_ctx_cpl_status(&ctx));
+    }
+
+    printf("[DEBUG][WRITE] Command queued: LBA=%lu, nlb=%u, buf_ptr=%p\n", lba, nlb, buf);
+    
+    // 콜백에서 버퍼를 해제하므로 NULL 반환
+    Py_RETURN_NONE;
+}
+
+static PyObject* xnvme_core_queue_read_command(PyObject* self, PyObject* args) {
+    PyObject* queue_ptr_obj;
+    PyObject* dev_ptr_obj;
+    uint32_t nsid;
+    uint64_t lba;
+    uint16_t nlb;
+    
+    if (!PyArg_ParseTuple(args, "OOIKH", &queue_ptr_obj, &dev_ptr_obj, &nsid, &lba, &nlb)) {
+        return NULL;
+    }
+    
+    struct xnvme_queue* queue = (struct xnvme_queue*)PyLong_AsVoidPtr(queue_ptr_obj);
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (!queue || !dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid queue or device pointer");
+        return NULL;
+    }
+    
+    const struct xnvme_geo* geo = xnvme_dev_get_geo(dev);
+    size_t buf_size = (nlb + 1) * geo->lba_nbytes;
+    void* buf = xnvme_buf_alloc(dev, buf_size);
+    if (!buf) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to allocate buffer");
+        return NULL;
+    }
+    
+    // 디버깅 출력
+    printf("[DEBUG][READ]  LBA=%lu, nlb=%u, buf_size=%zu, buf_ptr=%p\n",
+        lba, nlb, buf_size, buf);
+    printf("[DEBUG][ALLOC] buf_ptr=%p for LBA=%lu\n", buf, lba);
+    
+    // 큐를 사용한 비동기 읽기
+    struct xnvme_cmd_ctx* ctx = xnvme_queue_get_cmd_ctx(queue);
+    if (!ctx) {
+        printf("[DEBUG][READ] Failed to get command context from queue\n");
+        xnvme_buf_free(dev, buf);
+        PyErr_SetString(PyExc_RuntimeError, "Failed to get command context");
+        return NULL;
+    }
+    
+    // 콜백 등록
+    ctx->async.cb = read_cb;
+    ctx->async.cb_arg = buf;
+    
+    int err = xnvme_nvm_read(ctx, nsid, lba, nlb, buf, NULL);
+    if (err) {
+        printf("[DEBUG][READ] Read failed: err=%d\n", err);
+        xnvme_queue_put_cmd_ctx(queue, ctx);
+        xnvme_buf_free(dev, buf);
+        PyErr_SetString(PyExc_RuntimeError, "Failed to read data");
+        return NULL;
+    }
+    
+    printf("[DEBUG][READ] Command queued: LBA=%lu, nlb=%u, buf_ptr=%p\n", lba, nlb, buf);
+    
+    // 콜백에서 버퍼를 해제하므로 NULL 반환
+    Py_RETURN_NONE;
+}
+
+static PyObject* xnvme_core_submit_batch(PyObject* self, PyObject* args) {
+    PyObject* queue_ptr_obj;
+    PyObject* dev_ptr_obj;
+    int batch_size;
+    
+    if (!PyArg_ParseTuple(args, "OOi", &queue_ptr_obj, &dev_ptr_obj, &batch_size)) {
+        return NULL;
+    }
+    
+    struct xnvme_queue* queue = (struct xnvme_queue*)PyLong_AsVoidPtr(queue_ptr_obj);
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (!queue || !dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid queue or device pointer");
+        return NULL;
+    }
+    
+    while (xnvme_queue_get_outstanding(queue) > 0) {
+        printf("xnvme_queue_get_outstanding: %d\n", xnvme_queue_get_outstanding(queue));
+        xnvme_queue_poke(queue, 0);  // 0 = no limit (process all completions)
+    }
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject* xnvme_core_wait_completion(PyObject* self, PyObject* args) {
+    PyObject* queue_ptr_obj;
+    PyObject* dev_ptr_obj;
+    
+    if (!PyArg_ParseTuple(args, "OO", &queue_ptr_obj, &dev_ptr_obj)) {
+        return NULL;
+    }
+    
+    struct xnvme_queue* queue = (struct xnvme_queue*)PyLong_AsVoidPtr(queue_ptr_obj);
+    struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
+    if (!queue || !dev) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid queue or device pointer");
+        return NULL;
+    }
+    
+    printf("[DEBUG][WAIT] waiting for all completions...\n");
+    
+    // 모든 명령 완료 대기
+    printf("[DEBUG] Outstanding before drain: %u\n", xnvme_queue_get_outstanding(queue));
+    int err = xnvme_queue_drain(queue);
+    if (err != 0) {
+        fprintf(stderr, "[DEBUG][WAIT] drain failed: err=%d (%s)\n", err, strerror(err));
+        return PyErr_Format(PyExc_RuntimeError, "Drain failed: %s", strerror(err));
+        //return NULL;
+    }
+    
+    printf("[DEBUG][WAIT] all completions done\n");
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject* xnvme_core_destroy_async_queue(PyObject* self, PyObject* args) {
+    PyObject* queue_ptr_obj;
+    
+    if (!PyArg_ParseTuple(args, "O", &queue_ptr_obj)) {
+        return NULL;
+    }
+    
+    struct xnvme_queue* queue = (struct xnvme_queue*)PyLong_AsVoidPtr(queue_ptr_obj);
+    if (queue) {
+        xnvme_queue_term(queue);
+    }
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject* xnvme_core_get_buffer_data(PyObject* self, PyObject* args) {
+    PyObject* buf_ptr_obj;
+    size_t size;
+    
+    if (!PyArg_ParseTuple(args, "On", &buf_ptr_obj, &size)) {
+        return NULL;
+    }
+    
+    void* buf = PyLong_AsVoidPtr(buf_ptr_obj);
+    if (!buf) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid buffer pointer");
+        return NULL;
+    }
+    
+    // 디버깅 출력
+    printf("[DEBUG][GET_DATA] buf_ptr=%p, size=%zu, data[0:8]=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+        buf, size,
+        ((unsigned char*)buf)[0], ((unsigned char*)buf)[1], ((unsigned char*)buf)[2], ((unsigned char*)buf)[3],
+        ((unsigned char*)buf)[4], ((unsigned char*)buf)[5], ((unsigned char*)buf)[6], ((unsigned char*)buf)[7]);
+    
+    // 전체 버퍼를 Python bytes로 변환
+    PyObject* result = PyBytes_FromStringAndSize((char*)buf, size);
+    if (!result) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to create bytes object");
+        return NULL;
+    }
+    
+    return result;
+}
+
+// 메서드 정의
+static PyMethodDef XnvmeCoreMethods[] = {
+    {"open_device", xnvme_core_open_device, METH_VARARGS, "Open NVMe device"},
+    {"close_device", xnvme_core_close_device, METH_VARARGS, "Close NVMe device"},
+    {"get_geometry", xnvme_core_get_geometry, METH_VARARGS, "Get device geometry"},
+    {"sync_write", xnvme_core_sync_write, METH_VARARGS, "Synchronous write"},
+    {"sync_read", xnvme_core_sync_read, METH_VARARGS, "Synchronous read"},
+    {"trim", xnvme_core_trim, METH_VARARGS, "TRIM (write zeroes)"},
+    {"create_queue", xnvme_core_create_queue, METH_VARARGS, "Create async queue"},
+    {"destroy_queue", xnvme_core_destroy_queue, METH_VARARGS, "Destroy async queue"},
+    {"free_buffer", xnvme_core_free_buffer, METH_VARARGS, "Free allocated buffer"},
+    {"create_async_queue", xnvme_core_create_async_queue, METH_VARARGS, "Create async queue for batch processing"},
+    {"queue_write_command", xnvme_core_queue_write_command, METH_VARARGS, "Queue write command (no submit)"},
+    {"queue_read_command", xnvme_core_queue_read_command, METH_VARARGS, "Queue read command (no submit)"},
+    {"submit_batch", xnvme_core_submit_batch, METH_VARARGS, "Submit batch of commands"},
+    {"wait_completion", xnvme_core_wait_completion, METH_VARARGS, "Wait for all commands to complete"},
+    {"destroy_async_queue", xnvme_core_destroy_async_queue, METH_VARARGS, "Destroy async queue"},
+    {"get_buffer_data", xnvme_core_get_buffer_data, METH_VARARGS, "Get data from buffer"},
+    {NULL, NULL, 0, NULL}
+};
+
+// 모듈 정의
+static struct PyModuleDef xnvme_core_module = {
+    PyModuleDef_HEAD_INIT,
+    "xnvme_core",
+    "Core xNVMe functions for Python",
+    -1,
+    XnvmeCoreMethods
+};
+
+// 모듈 초기화 함수
+PyMODINIT_FUNC PyInit_xnvme_core(void) {
+    return PyModule_Create(&xnvme_core_module);
+} 

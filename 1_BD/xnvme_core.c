@@ -3,11 +3,6 @@
 #include <libxnvme.h>
 #include <string.h>
 #include <numpy/arrayobject.h>
-#include <stdlib.h>
-typedef struct {
-    PyObject* obj;
-    Py_buffer view;
-} BufferCtx;
 
 static PyObject* xnvme_core_dev_open(PyObject* self, PyObject* args) {
     const char* device_path;
@@ -256,6 +251,7 @@ static PyObject* xnvme_core_buf_free(PyObject* self, PyObject* args) {
     void* buf = PyLong_AsVoidPtr(buf_ptr_obj);
 
     if (dev && buf) {
+        // printf("[DEBUG][xnvme_core][core_buf_free] buf_ptr=%p\n", buf);
         xnvme_buf_free(dev, buf);
     }
 
@@ -294,12 +290,7 @@ static void write_cb(struct xnvme_cmd_ctx *ctx, void *cb_arg) {
     }
 
     if (cb_arg) {
-        BufferCtx* bctx = (BufferCtx*)cb_arg;
-        PyGILState_STATE gstate = PyGILState_Ensure();
-        PyBuffer_Release(&bctx->view);
-        Py_DECREF(bctx->obj);
-        PyGILState_Release(gstate);
-        free(bctx);
+        xnvme_buf_free(ctx->dev, cb_arg);
     }
 
     xnvme_queue_put_cmd_ctx(ctx->async.queue, ctx);
@@ -320,16 +311,11 @@ static PyObject* xnvme_core_async_write(PyObject* self, PyObject* args) {
     uint32_t nsid;
     uint64_t lba;
     uint16_t nlb;
-    BufferCtx* bctx = NULL;
-    struct xnvme_cmd_ctx* ctx = NULL;
 
-    // 1. parse arguments
     if (!PyArg_ParseTuple(args, "OOOIKH", &queue_ptr_obj, &dev_ptr_obj, &data_obj, &nsid, &lba, &nlb)) {
-        PyErr_SetString(PyExc_ValueError, "Invalid arguments");
         return NULL;
     }
 
-    // 2. check pointer
     struct xnvme_queue* queue = (struct xnvme_queue*)PyLong_AsVoidPtr(queue_ptr_obj);
     struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
     if (!queue || !dev) {
@@ -337,62 +323,54 @@ static PyObject* xnvme_core_async_write(PyObject* self, PyObject* args) {
         return NULL;
     }
 
-    // 3. set buffer
+    // Get buffer from Python object
     Py_buffer view;
     if (PyObject_GetBuffer(data_obj, &view, PyBUF_SIMPLE) != 0) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to get buffer from data object");
-        goto error_exit;
+        return NULL;
     }
 
-    // 4. check buffer size and alignment
+    // [TEST] Try xnvme_mem_map/unmap on the Python buffer
+    //int map_err = xnvme_mem_map(NULL, view.buf, view.len);
+    //printf("[DEBUG][xnvme_core][async_write] mem_map: err=%d, buf=%p, len=%zd\n", map_err, view.buf, view.len);
+    //xnvme_mem_unmap(NULL, view.buf);
+    //printf("[DEBUG][xnvme_core][async_write] mem_unmap done\n");
+
+
+    // Calculate buffer size and allocate buffer
     size_t buf_size = (nlb + 1) * xnvme_dev_get_geo(dev)->lba_nbytes;
-    if (view.len < buf_size) {
-        PyErr_SetString(PyExc_ValueError, "Buffer size too small");
-        goto error_buffer;
-    }
-    if (((uintptr_t)view.buf) % 4096 != 0) {
-        PyErr_SetString(PyExc_ValueError, "Buffer not 4K aligned");
-        goto error_buffer;
+    void* buf = xnvme_buf_alloc(dev, buf_size);
+    if (!buf) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "Failed to allocate buffer");
+        return NULL;
     }
 
-    // 5. prepare callback context
-    bctx = malloc(sizeof(BufferCtx));
-    if (!bctx) {
-        PyErr_NoMemory();
-        goto error_buffer;
-    }
-    bctx->obj = data_obj;
-    bctx->view = view;
-    Py_INCREF(data_obj);
+    // Copy data to allocated buffer
+    memcpy(buf, view.buf, buf_size);
 
-    // 6. prepare command context
-    ctx = xnvme_queue_get_cmd_ctx(queue);
-    if (!ctx) {
-        PyErr_SetString(PyExc_RuntimeError, "Failed to get command context");
-        goto error_ctx;
-    }
-    ctx->async.cb = write_cb;
-    ctx->async.cb_arg = bctx;
-
-    // 7. execute write command
-    int err = xnvme_nvm_write(ctx, nsid, lba, nlb, view.buf, NULL);
-    if (err) {
-        PyErr_Format(PyExc_IOError, "Write failed with error: %d", err);
-        goto error_write;
-    }
-
-    return Py_None;
-
-    // error handling
-error_write:
-    xnvme_queue_put_cmd_ctx(queue, ctx);
-error_ctx:
-    Py_DECREF(data_obj);
-    free(bctx);
-error_buffer:
     PyBuffer_Release(&view);
-error_exit:
-    return NULL;
+
+    struct xnvme_cmd_ctx* ctx = xnvme_queue_get_cmd_ctx(queue);
+    if (!ctx) {
+        printf("[DEBUG][xnvme_core][async_write] Failed to get command context from queue\n");
+        xnvme_buf_free(dev, buf);
+        PyErr_SetString(PyExc_RuntimeError, "Failed to get command context");
+        return NULL;
+    }
+
+    ctx->async.cb = write_cb;
+    ctx->async.cb_arg = buf;
+
+    int err = xnvme_nvm_write(ctx, nsid, lba, nlb, buf, NULL);
+    if (err) {
+        printf("[DEBUG][xnvme_core][async_write] Write failed: err=%d\n", err);
+        xnvme_buf_free(dev, buf);
+        PyErr_SetString(PyExc_RuntimeError, "Failed to write data");
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
 }
 
 static PyObject* xnvme_core_async_read(PyObject* self, PyObject* args) {
@@ -402,54 +380,37 @@ static PyObject* xnvme_core_async_read(PyObject* self, PyObject* args) {
     uint32_t nsid;
     uint64_t lba;
     uint16_t nlb;
-    struct xnvme_cmd_ctx* ctx = NULL;
-    void* buf = NULL;
 
-    // 1. parse arguments
     if (!PyArg_ParseTuple(args, "OOOIKH", &queue_ptr_obj, &dev_ptr_obj, &buf_ptr_obj, &nsid, &lba, &nlb)) {
-        PyErr_SetString(PyExc_ValueError, "Invalid arguments");
         return NULL;
     }
 
-    // 2. check pointers
     struct xnvme_queue* queue = (struct xnvme_queue*)PyLong_AsVoidPtr(queue_ptr_obj);
     struct xnvme_dev* dev = (struct xnvme_dev*)PyLong_AsVoidPtr(dev_ptr_obj);
-    buf = PyLong_AsVoidPtr(buf_ptr_obj);
+    void* buf = (void*)PyLong_AsVoidPtr(buf_ptr_obj);
     if (!queue || !dev || !buf) {
         PyErr_SetString(PyExc_RuntimeError, "Invalid queue, device, or buffer pointer");
         return NULL;
     }
 
-    // 3. check buffer alignment
-    if (((uintptr_t)buf) % 4096 != 0) {
-        PyErr_SetString(PyExc_ValueError, "Buffer not 4K aligned");
-        return NULL;
-    }
-
-    // 4. prepare command context
-    ctx = xnvme_queue_get_cmd_ctx(queue);
+    struct xnvme_cmd_ctx* ctx = xnvme_queue_get_cmd_ctx(queue);
     if (!ctx) {
+        printf("[DEBUG][xnvme_core][async_read] Failed to get command context from queue\n");
         PyErr_SetString(PyExc_RuntimeError, "Failed to get command context");
         return NULL;
     }
 
-    // 5. setup callback
     ctx->async.cb = read_cb;
-    ctx->async.cb_arg = NULL;  // buffer is managed by caller
+    ctx->async.cb_arg = NULL;  // buf is managed by caller
 
-    // 6. execute read command
     int err = xnvme_nvm_read(ctx, nsid, lba, nlb, buf, NULL);
     if (err) {
-        PyErr_Format(PyExc_IOError, "Read failed with error: %d", err);
-        goto error_read;
+        printf("[DEBUG][xnvme_core][async_read] Read failed: err=%d\n", err);
+        PyErr_SetString(PyExc_RuntimeError, "Failed to read data");
+        return NULL;
     }
 
-    return Py_None;
-
-    // error handling
-error_read:
-    xnvme_queue_put_cmd_ctx(queue, ctx);
-    return NULL;
+    Py_RETURN_NONE;
 }
 
 static PyObject* xnvme_core_queue_poke(PyObject* self, PyObject* args) {
@@ -527,10 +488,10 @@ static PyObject* xnvme_core_get_buffer_view(PyObject* self, PyObject* args) {
         return NULL;
     }
 
-    // PyBUF_WRITE: return memoryview that can be read/written
+    // PyBUF_WRITE: 읽기/쓰기 가능한 memoryview 반환
     return PyMemoryView_FromMemory((char*)buf, size, PyBUF_WRITE);
 }
-/*
+
 static PyObject* xnvme_core_mem_map(PyObject* self, PyObject* args) {
     PyObject* data_obj;
     Py_ssize_t offset;
@@ -540,18 +501,21 @@ static PyObject* xnvme_core_mem_map(PyObject* self, PyObject* args) {
         return NULL;
     }
 
+    // Python 객체에서 버퍼 프로토콜을 통해 포인터 얻기
     Py_buffer view;
     if (PyObject_GetBuffer(data_obj, &view, PyBUF_SIMPLE) != 0) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to get buffer from data object");
         return NULL;
     }
 
+    // 오프셋과 크기 검증
     if (offset < 0 || size < 0 || offset + size > view.len) {
         PyBuffer_Release(&view);
         PyErr_SetString(PyExc_ValueError, "Invalid offset or size");
         return NULL;
     }
 
+    // xnvme_mem_map을 사용하여 DMA 매핑 (dev는 NULL로 전달)
     int err = xnvme_mem_map(NULL, (char*)view.buf + offset, size);
     if (err != 0) {
         PyBuffer_Release(&view);
@@ -560,6 +524,7 @@ static PyObject* xnvme_core_mem_map(PyObject* self, PyObject* args) {
     }
     void* mapped_ptr = (char*)view.buf + offset;
 
+    // 버퍼 뷰 해제 (포인터는 여전히 유효)
     PyBuffer_Release(&view);
 
     return PyLong_FromVoidPtr(mapped_ptr);
@@ -579,7 +544,7 @@ static PyObject* xnvme_core_mem_unmap(PyObject* self, PyObject* args) {
     
     Py_RETURN_NONE;
 }
-*/
+
 // methods
 static PyMethodDef XnvmeCoreMethods[] = {
     {"dev_open", xnvme_core_dev_open, METH_VARARGS, "Open NVMe device"},
@@ -598,8 +563,8 @@ static PyMethodDef XnvmeCoreMethods[] = {
     {"queue_poke", xnvme_core_queue_poke, METH_VARARGS, "Process outstanding commands"},
     //{"get_buffer_data", xnvme_core_get_buffer_data, METH_VARARGS, "Get data from buffer"},
     {"get_buffer_view", xnvme_core_get_buffer_view, METH_VARARGS, "Get memoryview from buffer (zero-copy)"},
-    //{"mem_map", xnvme_core_mem_map, METH_VARARGS, "Map memory region from Python object (zero-copy)"},
-    //{"mem_unmap", xnvme_core_mem_unmap, METH_VARARGS, "Unmap memory region (no-op for safety)"},
+    {"mem_map", xnvme_core_mem_map, METH_VARARGS, "Map memory region from Python object (zero-copy)"},
+    {"mem_unmap", xnvme_core_mem_unmap, METH_VARARGS, "Unmap memory region (no-op for safety)"},
     {NULL, NULL, 0, NULL}
 };
 
