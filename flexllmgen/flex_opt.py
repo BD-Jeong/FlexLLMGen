@@ -879,6 +879,10 @@ class OptLM:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
 
         # Generate
+        print("\033[32mBD: OptLM Debug Mode, \033[0m", debug_mode)
+        print("\033[32mBD: OptLM Overlap, \033[0m", overlap)
+        print("\033[32mBD: OptLM Num GPU Batches, \033[0m", num_gpu_batches)
+        print("\033[32mBD: OptLM Num Layers, \033[0m", num_layers)
         if debug_mode is None:
             if not overlap:
                 # No overlap, easy to understand, suitable for debugging
@@ -1198,7 +1202,7 @@ def run_flexllmgen(args):
     elif args.bd_mode == "file":
         disk = TorchDisk(args.offload_dir)
     elif args.bd_mode == "block":
-        disk = TorchNVMe(args.bd_device)
+        disk = TorchNVMe(args.bd_device, args.offload_dir)
     elif args.bd_mode == "fdp":
         disk = TorchDisk(args.offload_dir)
     else:

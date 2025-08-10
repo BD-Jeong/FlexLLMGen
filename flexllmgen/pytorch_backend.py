@@ -624,13 +624,13 @@ class TorchDevice:
     def __str__(self):
         return f"TorchDevice(name={self.name})"
 
-# BD
+# BD: NVMe device
 class TorchNVMe:
-    def __init__(self, path, mem_capacity=None, cuda_id=0, num_copy_threads=1, start_lba=2048):
+    def __init__(self, nvme_path, file_path, mem_capacity=None, cuda_id=0, num_copy_threads=1, start_lba=2048):
         print("\033[32mBD: num_copy_threads: ", num_copy_threads, "\033[0m")
         
         # Initialize NVMe device
-        self.nvme_device = NVMeDevice(uri=path, use_io_uring=True)
+        self.nvme_device = NVMeDevice(uri=nvme_path, use_io_uring=True)
         self.lba_size = self.nvme_device.get_lba_size()
         # Align to 4K boundary (8 LBA blocks) for better performance
         aligned_start_lba = ((start_lba + 7) // 8) * 8
@@ -645,14 +645,53 @@ class TorchNVMe:
         # LBA management: tensor_name -> Start LBA, Num Blocks
         self.tensor_lba_map = {}  # {tensor_name: {'start_lba': int, 'num_blocks': int}}
 
+        # Torch Disk tensor management: tensor_name -> {'device': TorchDisk, 'tensor': TorchTensor}
+        self.torch_disk_tensor_map = {}  # {tensor_name: {'device': TorchDisk, 'tensor': TorchTensor}}
+
         print("\033[32mBD: TorchNVMe Init.", "\033[0m")
-        print("-device_path: ", path)
+        print("-device_path: ", nvme_path)
         print("-lba_size: ", self.lba_size)
         print("-start_lba: ", self.start_lba)
 
+        # Create TorchDisk instance for some tensors
+        self.torch_disk = TorchDisk(file_path, mem_capacity, cuda_id, num_copy_threads=0, parent_torch_nvme=self)
+        # mmap_limit ratio: Need to experiment with 1.5x, 2.0x, 2.5x, 3.0x
+        # Factors to consider:
+        # - GPU memory pressure
+        # - System memory availability  
+        # - I/O pattern (sequential vs random)
+        # - Page cache vs Direct I/O performance
+        
+        # Calculate total memory reservation for various components:
+        # 1. Copy thread pinned memory: num_copy_threads * 1GB
+        # 2. TorchDisk copy thread pinned memory: num_copy_threads * 1GB (if using separate threads)
+        # 3. System overhead: ~20% of total pinned memory
+        #    - Memory fragmentation: ~8% (common in long-running processes with frequent alloc/dealloc)
+        #    - Page table overhead: ~3% (for large pinned memory regions, ~262K pages for 1GB)
+        #    - Kernel buffer overhead: ~5% (for DMA operations between CUDA and NVMe)
+        #    - NUMA alignment: ~2% (for optimal memory placement in multi-socket systems)
+        #    - Other system overheads: ~2% (TLB misses, cache line alignment, etc.)
+        #    Reference: Linux kernel documentation, CUDA pinned memory guidelines, NUMA optimization papers
+        #    Detailed analysis: See docs/memory_overhead_analysis.md
+        # 4. Page cache overhead: ~10% of mmap limit
+        # 5. Safety margin: ~500MB for unexpected allocations
+        pinned_memory_mb = num_copy_threads * 1024 * 1  # 1GB per thread
+        system_overhead_mb = pinned_memory_mb * 0.2  # 20% overhead (empirically determined)
+        safety_margin_mb = 500  # 500MB safety margin
+        
+        total_reserve_mb = pinned_memory_mb + system_overhead_mb + safety_margin_mb
+        
+        print(f"\033[32mBD: Memory reservation calculation\033[0m")
+        print(f"  - num_copy_threads: {num_copy_threads}")
+        print(f"  - pinned_memory_mb: {pinned_memory_mb} MB ({num_copy_threads} × 2GB)")
+        print(f"  - system_overhead_mb: {system_overhead_mb} MB (20% of pinned)")
+        print(f"  - safety_margin_mb: {safety_margin_mb} MB")
+        print(f"  - total_reserve_mb: {total_reserve_mb} MB")
+        
+        self.mmap_limit = estimate_effective_mmap_limit(reserve_mb=total_reserve_mb)
 
         # Device type and other attributes
-        self.name = path
+        self.name = nvme_path
         self.device_type = DeviceType.DISK
         self.compressed_device = TorchCompressedDevice(self)
         
@@ -660,8 +699,9 @@ class TorchNVMe:
         self.copy_queue = queue.Queue()
         self.copy_threads = [
             threading.Thread(
-                target=copy_worker_func_nvme, args=(self.copy_queue, cuda_id)
-            ) for _ in range(num_copy_threads)
+                target=copy_worker_func_nvme, args=(self.copy_queue, cuda_id),
+                name=f"thread_{i+1}"
+            ) for i in range(num_copy_threads)
         ]
         for t in self.copy_threads:
             t.start()
@@ -681,6 +721,28 @@ class TorchNVMe:
     def allocate(self, shape, dtype, pin_memory=None, name=None):
         name = name or TorchTensor.next_name()
         
+        # Calculate tensor size in bytes
+        tensor_bytes = np.prod(shape) * torch_dtype_to_num_bytes[np_dtype_to_torch_dtype[dtype]]
+        
+        # Check if K/V cache pair fits within remaining mmap_limit
+        kv_pair_bytes = tensor_bytes #* 2  # K + V tensor
+        if kv_pair_bytes <= self.mmap_limit :
+            # Use TorchDisk for this K/V cache tensor
+            disk_tensor = self.torch_disk.allocate(shape, dtype, pin_memory, name)
+            self.torch_disk_tensor_map[name] = {
+                'device': self.torch_disk,
+                'tensor': disk_tensor
+            }
+            # Subtract allocated bytes from mmap_limit
+            self.mmap_limit -= kv_pair_bytes
+            print(f"\033[32mBD: TorchDisk allocate (KV cache), {name}\033[0m")
+            print(f"  - shape: {shape}, dtype: {dtype}")
+            print(f"  - tensor_bytes: {tensor_bytes / (1024*1024):.2f} MB")
+            print(f"  - kv_pair_bytes: {kv_pair_bytes / (1024*1024):.2f} MB")
+            print(f"  - remaining_mmap_limit: {self.mmap_limit / (1024*1024):.2f} MB")
+            return disk_tensor
+        
+        # Use TorchNVMe for other tensors
         # calculate required blocks
         num_blocks = self._calculate_required_blocks(shape, dtype)
         
@@ -712,6 +774,15 @@ class TorchNVMe:
         return self.tensor_lba_map.get(tensor_name)
 
     def delete(self, tensor):
+        # Check if this tensor is stored on TorchDisk
+        if tensor.name in self.torch_disk_tensor_map:
+            # Delete from TorchDisk
+            disk_info = self.torch_disk_tensor_map[tensor.name]
+            disk_info['device'].delete(disk_info['tensor'])
+            del self.torch_disk_tensor_map[tensor.name]
+            print(f"\033[32mBD: TorchDisk delete\033[0m {tensor.name}")
+            return
+        
         # For NVMe tensors, use TRIM to properly free blocks
         if tensor.name in self.tensor_lba_map:
             # Get LBA information from tensor_lba_map
@@ -739,6 +810,7 @@ class TorchNVMe:
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
+
         return k_cache, v_cache
 
     def submit_copy(self, *args):
@@ -746,9 +818,17 @@ class TorchNVMe:
         self.copy_queue.put_nowait(args)
 
     def synchronize(self):
+        # Synchronize TorchDisk operations
+        #self.torch_disk.synchronize()
+        
+        # Synchronize NVMe operations
         self.copy_queue.join()
 
     def close_copy_threads(self):
+        # Close TorchDisk copy threads
+        #self.torch_disk.close_copy_threads()
+        
+        # Close NVMe copy threads
         for _ in range(len(self.copy_threads)):
             self.copy_queue.put_nowait(None)
         for t in self.copy_threads:
@@ -760,12 +840,7 @@ class TorchNVMe:
         raise NotImplementedError()
 
     def print_stats(self):
-        print(f"\033[32mBD: TorchNVMe Stats\033[0m")
-        print(f"  - Total tensors: {len(self.tensor_lba_map)}")
-        print(f"  - Next LBA: {self.next_lba}")
-        print(f"  - LBA size: {self.lba_size}")
-        for name, info in self.tensor_lba_map.items():
-            print(f"  - {name}: LBA {info['start_lba']}-{info['start_lba']+info['num_blocks']-1}")
+        raise NotImplementedError()
 
     def __del__(self):
         if hasattr(self, 'copy_queue') and self.copy_queue:
@@ -773,15 +848,22 @@ class TorchNVMe:
         if hasattr(self, 'nvme_device'):
             self.nvme_device.close()
 
+def read_disk_stat_bytes(dev="nvme1n1"):
+    with open(f"/sys/block/{dev}/stat") as f:
+        parts = f.read().split()
+        read_sectors = int(parts[2])
+        write_sectors = int(parts[6])
+    return read_sectors * 512, write_sectors * 512
 
 class TorchDisk:
     """Manage tensors stored on a disk."""
 
-    def __init__(self, path, mem_capacity=None, cuda_id=0, num_copy_threads=1):
+    def __init__(self, path, mem_capacity=None, cuda_id=0, num_copy_threads=1, parent_torch_nvme=None):
         print("\033[32mBD: num_copy_threads: ", num_copy_threads, "\033[0m")
         self.name = path
         self.path = os.path.abspath(os.path.expanduser(path))
         self.mem_capacity = mem_capacity
+        self.parent_torch_nvme = parent_torch_nvme
 
         self.device_type = DeviceType.DISK
         self.compressed_device = TorchCompressedDevice(self)
@@ -793,12 +875,19 @@ class TorchDisk:
 
         self.links = {}
 
+        # BD Debug
+        self.expected_read_GB = 0
+        self.expected_write_GB = 0
+        self.dev_read_sector, self.dev_write_sector = read_disk_stat_bytes()
+        self.flag = False
+        
         # Copy threads
         self.copy_queue = queue.Queue()
         self.copy_threads = [
             threading.Thread(
-                target=copy_worker_func, args=(self.copy_queue, cuda_id)
-            ) for _ in range(num_copy_threads)
+                target=copy_worker_func, args=(self.copy_queue, cuda_id),
+                name=f"thread_{i+1}"
+            ) for i in range(num_copy_threads)
         ]
         for t in self.copy_threads:
             t.start()
@@ -814,14 +903,30 @@ class TorchDisk:
         name = name or TorchTensor.next_name()
         path = os.path.join(self.path, name)
         np.lib.format.open_memmap(path, mode="w+", shape=shape, dtype=dtype)
-        print("\033[32mBD: allocate\033[0m", name, path)
         return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
                            path, self, name=name)
 
     def delete(self, tensor):
-        pass
-        #if os.path.exists(tensor.data) and tensor.delete_file:
-        #    os.remove(tensor.data)
+        #BD
+        if self.flag == False:
+            dev_read_sector2, dev_write_sector2 = read_disk_stat_bytes()
+            total_read_sector = dev_read_sector2 - self.dev_read_sector
+            total_write_sector = dev_write_sector2 - self.dev_write_sector
+            actual_read_GB = total_read_sector  / 1024 / 1024 / 1024
+            actual_write_GB = total_write_sector / 1024 / 1024 / 1024
+            self.flag = True
+
+            dram_read_hit_ratio = 1 - actual_read_GB / self.expected_read_GB
+            dram_write_hit_ratio = 1 - actual_write_GB / self.expected_write_GB
+
+            print(f"[BD] expected_read_GB: {self.expected_read_GB}, expected_write_GB: {self.expected_write_GB}")
+            print(f"[BD] actual_read_GB: {actual_read_GB}, actual_write_GB: {actual_write_GB}")
+            print(f"[BD] dram_read_hit_ratio: {dram_read_hit_ratio}, dram_write_hit_ratio: {dram_write_hit_ratio}")
+
+            self.flag = True
+
+        if os.path.exists(tensor.data) and tensor.delete_file:
+            os.remove(tensor.data)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
@@ -839,7 +944,15 @@ class TorchDisk:
         return k_cache, v_cache
 
     def submit_copy(self, *args):
-        self.copy_queue.put_nowait(args)
+        dst, dst_indices, src, src_indices = args
+        
+        # Redirect to parent TorchNVMe for unified processing
+        if self.parent_torch_nvme:
+            #print(f"Redirecting TorchDisk copy to parent TorchNVMe")
+            self.parent_torch_nvme.submit_copy(*args)
+        else:
+            # Fallback to direct copy if no parent found
+            self.copy_queue.put_nowait(args)
 
     def synchronize(self):
         self.copy_queue.join()
@@ -1033,17 +1146,6 @@ def map_to_torch_tensor(tensor, indices):
     if tensor.device.device_type == DeviceType.DISK:
         # Open memmap and apply madvise to minimize page cache usage
         mmap_obj = np.lib.format.open_memmap(tensor.data)
-        
-        # Apply madvise to minimize page cache usage
-        try:
-            import mmap
-            # MADV_DONTNEED: Tell kernel we don't need these pages in memory
-            # This helps reduce page cache pressure
-            #mmap_obj.madvise(22) # MADV_PAGEOUT = 22
-        except (ImportError, AttributeError):
-            # Fallback if madvise is not available
-            pass
-        
         data = torch.from_numpy(mmap_obj)
     else:
         data = tensor.data
@@ -1127,11 +1229,17 @@ def copy_worker_func(queue, cuda_id):
 
                 # FILE Write Check (CUDA → DISK)
                 if (src.device.device_type == DeviceType.CUDA and dst.device.device_type == DeviceType.DISK):
-                    print("[FILE Write] src_data shape:", tmp_cpu_buf.shape)
+                    io_size = tmp_cpu_buf.numel() * tmp_cpu_buf.element_size()  # bytes
+                    dst.device.expected_write_GB += io_size / 1024 / 1024 / 1024
+                    print(f"[FILE Write] thread_name: {threading.current_thread().name}, dst.name: {dst.name}, dst_indices: {dst_indices}")
+                    #print(f"[FILE Write] IO size: {io_size} bytes ({io_size/1024/1024:.2f} MB)")
                     
                 # FILE Read Check (DISK → CUDA)  
                 if (src.device.device_type == DeviceType.DISK and dst.device.device_type == DeviceType.CUDA):
-                    print("[FILE Read] src_data shape:", tmp_cpu_buf.shape)
+                    io_size = tmp_cpu_buf.numel() * tmp_cpu_buf.element_size()  # bytes
+                    src.device.expected_read_GB += io_size / 1024 / 1024 / 1024
+                    print(f"[FILE Read] thread_name: {threading.current_thread().name}, src.name: {src.name}, src_indices: {src_indices}")
+                    #print(f"[FILE Read] IO size: {io_size} bytes ({io_size/1024/1024:.2f} MB)")
 
                 dst_data.copy_(tmp_cpu_buf)
             else:
@@ -1141,6 +1249,9 @@ def copy_worker_func(queue, cuda_id):
 
 def copy_worker_func_nvme(queue, cuda_id):
     """The copy worker thread for NVMe direct access."""
+
+
+
     torch.cuda.set_device(cuda_id)
 
     # 4k aligned pinned buffer
@@ -1158,7 +1269,45 @@ def copy_worker_func_nvme(queue, cuda_id):
                 queue.task_done()
                 return
             
-            dst, dst_indices, src, src_indices = item            
+            dst, dst_indices, src, src_indices = item
+            
+            # Check if either tensor is on TorchDisk
+            is_torch_disk_tensor = (
+                isinstance(dst.device, TorchDisk) or
+                isinstance(src.device, TorchDisk)
+            )
+            
+            if is_torch_disk_tensor:
+                src_data = map_to_torch_tensor(src, src_indices)
+                dst_data = map_to_torch_tensor(dst, dst_indices)
+
+                if (src.device.device_type == DeviceType.CUDA or
+                    dst.device.device_type == DeviceType.CUDA):
+                    # Use a pinned cpu buffer as a relay
+                    size = np.prod(src_data.shape)
+                    tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+                    tmp_cpu_buf.copy_(src_data)
+
+                    # FILE Write Check (CUDA → DISK)
+                    if (src.device.device_type == DeviceType.CUDA and dst.device.device_type == DeviceType.DISK):
+                        io_size = tmp_cpu_buf.numel() * tmp_cpu_buf.element_size()  # bytes
+                        dst.device.expected_write_GB += io_size / 1024 / 1024 / 1024
+                        print(f"[FILE Write] thread_name: {threading.current_thread().name}, dst.name: {dst.name}, dst_indices: {dst_indices}")
+                        #print(f"[FILE Write] IO size: {io_size} bytes ({io_size/1024/1024:.2f} MB)")
+                    
+                    # FILE Read Check (DISK → CUDA)  
+                    if (src.device.device_type == DeviceType.DISK and dst.device.device_type == DeviceType.CUDA):
+                        io_size = tmp_cpu_buf.numel() * tmp_cpu_buf.element_size()  # bytes
+                        src.device.expected_read_GB += io_size / 1024 / 1024 / 1024
+                        print(f"[FILE Read] thread_name: {threading.current_thread().name}, src.name: {src.name}, src_indices: {src_indices}")
+                        #print(f"[FILE Read] IO size: {io_size} bytes ({io_size/1024/1024:.2f} MB)")
+
+                    dst_data.copy_(tmp_cpu_buf)
+                else:
+                    dst_data.copy_(src_data)
+
+                queue.task_done()
+                continue
 
             is_nvme_write = (dst.device.device_type == DeviceType.DISK and 
                            hasattr(dst.device, 'nvme_device') and 
@@ -1181,7 +1330,7 @@ def copy_worker_func_nvme(queue, cuda_id):
                     data_mv = memoryview(tmp_cpu_buf.numpy()).cast('B')
                     dst.device.nvme_device.async_write(data_mv, actual_start_lba)
                     # Write Check
-                    print("[NVMe Write] src_data shape:", tmp_cpu_buf.shape, "lba:", actual_start_lba, "size:", size)
+                    print("[NVMe Write] thread_name: {threading.current_thread().name}, src_data shape:", tmp_cpu_buf.shape, "lba:", actual_start_lba, "size:", size)
                 else:
                     assert False, "not implemented yet"
                     # CPU -> NVMe
@@ -1194,7 +1343,7 @@ def copy_worker_func_nvme(queue, cuda_id):
                 src_data = torch.frombuffer(data_bytes, dtype=src.dtype).reshape(indexed_shape)
                 dst_data = map_to_torch_tensor(dst, dst_indices)
                 # Read Check
-                print("[NVMe Read] src_data shape:", src_data.shape, "lba:", actual_start_lba, "size:", indexed_bytes)
+                print("[NVMe Read] thread_name: {threading.current_thread().name}, src_data shape:", src_data.shape, "lba:", actual_start_lba, "size:", indexed_bytes)
 
                 if dst.device.device_type == DeviceType.CUDA:
                     dst_data.copy_(src_data)
@@ -1217,3 +1366,75 @@ def copy_worker_func_nvme(queue, cuda_id):
                 assert False, "This case should not be reached in NVMe copy worker"
 
             queue.task_done()
+
+def get_meminfo_available_kb():
+    # Get available memory from /proc/meminfo
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1])  # in KB
+    return 0
+
+def get_own_cgroup_memory_info():
+    # Get current process's cgroup memory.current and memory.max (bytes)
+    try:
+        with open("/proc/self/cgroup", "r") as f:
+            for line in f:
+                if line.startswith("0::"):
+                    cgroup_rel_path = line.strip().split("0::")[1]
+                    break
+            else:
+                return None
+
+        cgroup_path = os.path.join("/sys/fs/cgroup", cgroup_rel_path.lstrip("/"))
+
+        with open(os.path.join(cgroup_path, "memory.current")) as f:
+            current = int(f.read().strip())
+
+        with open(os.path.join(cgroup_path, "memory.max")) as f:
+            raw = f.read().strip()
+            mem_max = None if raw == "max" else int(raw)
+
+        return {
+            "memory_used_bytes": current,
+            "memory_limit_bytes": mem_max,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+def estimate_effective_mmap_limit(reserve_mb):
+    # Estimate the effective mmap limit (in MB) by comparing MemAvailable and cgroup limit
+    # 1. System available memory
+    mem_available_kb = get_meminfo_available_kb()
+    mem_available_bytes = mem_available_kb * 1024
+
+    # 2. cgroup limit
+    cgroup_info = get_own_cgroup_memory_info()
+    if not cgroup_info or "error" in cgroup_info:
+        return {
+            "error": "Failed to read cgroup memory info.",
+            "MemAvailable_MB": mem_available_bytes // (1024 * 1024),
+            "EffectiveLimit_MB": mem_available_bytes // (1024 * 1024) - reserve_mb
+        }
+
+    limit = cgroup_info["memory_limit_bytes"]
+    used = cgroup_info["memory_used_bytes"]
+
+    if limit is None:
+        # No limit, use system available memory as limit
+        limit_remaining = mem_available_bytes
+    else:
+        limit_remaining = max(0, limit - used)
+
+    effective_mmap_bytes = min(mem_available_bytes, limit_remaining)
+    effective_mmap_mb = effective_mmap_bytes // (1024 * 1024)
+
+    print("\033[32mBD: estimate_effective_mmap_limit\033[0m")
+    print(f"  - MemAvailable_MB: {mem_available_bytes // (1024 * 1024)}")
+    print(f"  - CgroupLimit_MB: {limit // (1024 * 1024) if limit else None}")
+    print(f"  - CgroupUsed_MB: {used // (1024 * 1024)}")
+    print(f"  - ReserveMB: {reserve_mb} (pinned_memory + overhead + safety)")
+    print(f"  - EffectiveLimit_MB: {max(0, effective_mmap_mb - reserve_mb)}")
+
+    return effective_mmap_bytes - reserve_mb * 1024 * 1024
